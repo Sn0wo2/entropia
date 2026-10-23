@@ -5,9 +5,7 @@ import (
 	"strings"
 )
 
-type Text struct{}
-
-func (Text) String(value any) string {
+func String(value any) string {
 	switch typed := value.(type) {
 	case string:
 		return strings.TrimSpace(typed)

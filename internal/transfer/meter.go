@@ -6,12 +6,12 @@ import (
 )
 
 type Meter struct {
-	started    time.Time
-	uploaded   atomic.Int64
-	downloaded atomic.Int64
-	confirmed  atomic.Int64
-	attempts   atomic.Int64
-	failures   atomic.Int64
+	started         time.Time
+	Uploaded        atomic.Int64
+	Downloaded      atomic.Int64
+	ConfirmedUpload atomic.Int64
+	Attempts        atomic.Int64
+	Failures        atomic.Int64
 }
 
 type Snapshot struct {
@@ -23,22 +23,10 @@ type Snapshot struct {
 	Elapsed         time.Duration `json:"elapsed_ns"`
 }
 
-func (m *Meter) Add(direction Direction, n int64) {
-	if direction == Upload {
-		m.uploaded.Add(n)
-	} else {
-		m.downloaded.Add(n)
-	}
-}
-
-func (m *Meter) ConfirmUpload(n int64) { m.confirmed.Add(n) }
-func (m *Meter) Attempt()              { m.attempts.Add(1) }
-func (m *Meter) Failure()              { m.failures.Add(1) }
-
 func (m *Meter) Snapshot() Snapshot {
 	return Snapshot{
-		Uploaded: m.uploaded.Load(), Downloaded: m.downloaded.Load(),
-		ConfirmedUpload: m.confirmed.Load(), Attempts: m.attempts.Load(),
-		Failures: m.failures.Load(), Elapsed: time.Since(m.started),
+		Uploaded: m.Uploaded.Load(), Downloaded: m.Downloaded.Load(),
+		ConfirmedUpload: m.ConfirmedUpload.Load(), Attempts: m.Attempts.Load(),
+		Failures: m.Failures.Load(), Elapsed: time.Since(m.started),
 	}
 }

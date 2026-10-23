@@ -1,6 +1,7 @@
 package speedtest
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -31,66 +32,69 @@ func Discover(ctx context.Context) ([]Node, error) {
 		ResponseHeaderTimeout: 10 * time.Second,
 	}}
 	defer client.CloseIdleConnections()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.speedtest.net/api/js/servers?limit=100", nil)
 	if err != nil {
 		return nil, fmt.Errorf("speedtest legacy HTTP nodes are unofficial and experimental: discovery request: %w", err)
 	}
+
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 	req.Header.Set("Accept-Encoding", "identity")
 	req.Header.Set("Accept", "application/json,text/plain,*/*")
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("speedtest legacy HTTP nodes are unofficial and experimental: discovery: %w", err)
 	}
-	defer resp.Body.Close()
+
+	defer func() { _ = resp.Body.Close() }()
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("speedtest legacy HTTP nodes are unofficial and experimental: discovery status %s", resp.Status)
 	}
+
 	decoder := json.NewDecoder(io.LimitReader(resp.Body, 2<<20))
 	decoder.UseNumber()
+
 	start, err := decoder.Token()
 	if err != nil {
 		return nil, fmt.Errorf("speedtest legacy HTTP nodes are unofficial and experimental: discovery parse: %w", err)
 	}
+
 	if start != json.Delim('[') {
 		return nil, errors.New("speedtest legacy HTTP nodes are unofficial and experimental: discovery response must be a JSON array")
 	}
+
 	nodes := make([]Node, 0, 100)
+
 	count := 0
 	for ; count < 100 && decoder.More(); count++ {
 		var entry map[string]any
 		if err := decoder.Decode(&entry); err != nil {
 			return nil, fmt.Errorf("speedtest legacy HTTP nodes are unofficial and experimental: discovery parse: %w", err)
 		}
+
 		node := Node{
-			ID: utils.Text{}.String(entry["id"]), Name: utils.Text{}.String(entry["sponsor"]),
-			Country: utils.Text{}.String(entry["country"]), Host: utils.Text{}.String(entry["host"]),
-			URL: utils.Text{}.String(entry["url"]),
-		}
-		if node.ID == "" {
-			node.ID = utils.Text{}.String(entry["idstr"])
-		}
-		if node.Name == "" {
-			node.Name = utils.Text{}.String(entry["name"])
-		}
-		if node.Country == "" {
-			node.Country = utils.Text{}.String(entry["cc"])
-		}
-		if node.URL == "" {
-			node.URL = utils.Text{}.String(entry["uri"])
+			ID:      cmp.Or(utils.String(entry["id"]), utils.String(entry["idstr"])),
+			Name:    cmp.Or(utils.String(entry["sponsor"]), utils.String(entry["name"])),
+			Country: cmp.Or(utils.String(entry["country"]), utils.String(entry["cc"])),
+			Host:    utils.String(entry["host"]), URL: cmp.Or(utils.String(entry["url"]), utils.String(entry["uri"])),
 		}
 		if node.ID != "" && node.URL != "" {
 			nodes = append(nodes, node)
 		}
 	}
+
 	if count < 100 {
 		end, err := decoder.Token()
 		if err != nil {
 			return nil, fmt.Errorf("speedtest legacy HTTP nodes are unofficial and experimental: discovery parse: %w", err)
 		}
+
 		if end != json.Delim(']') {
 			return nil, errors.New("speedtest legacy HTTP nodes are unofficial and experimental: invalid discovery array")
 		}
 	}
+
 	return nodes, nil
 }

@@ -15,5 +15,6 @@ type BoundedBuffer struct {
 
 func (b *BoundedBuffer) Write(p []byte) (int, error) {
 	b.Data = append(b.Data, p[:min(len(p), max(0, b.Limit-len(b.Data)))]...)
+
 	return len(p), nil
 }

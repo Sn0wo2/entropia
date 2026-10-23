@@ -15,12 +15,14 @@ type Report struct {
 	AverageRate    float64 `json:"average_bytes_per_second"`
 }
 
-func Run[E Engine](ctx context.Context, engine E, plan Plan, progress func(Snapshot)) (Report, error) {
+func Run(ctx context.Context, engine Engine, plan Plan, progress func(Snapshot)) (Report, error) {
 	report := Report{TargetDownload: plan.Download, TargetUpload: plan.Upload}
 	if err := plan.Validate(); err != nil {
 		report.State, report.Error = "failed", err.Error()
+
 		return report, err
 	}
+
 	var cancel context.CancelFunc
 	if plan.Duration > 0 {
 		ctx, cancel = context.WithTimeout(ctx, plan.Duration)
@@ -28,13 +30,17 @@ func Run[E Engine](ctx context.Context, engine E, plan Plan, progress func(Snaps
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	defer cancel()
+
 	meter := &Meter{started: time.Now()}
 	done := make(chan struct{})
+
 	if progress != nil {
 		go func() {
 			defer close(done)
+
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
+
 			for {
 				select {
 				case <-ctx.Done():
@@ -47,12 +53,15 @@ func Run[E Engine](ctx context.Context, engine E, plan Plan, progress func(Snaps
 	} else {
 		close(done)
 	}
+
 	var err error
+
 	for _, direction := range []Direction{Download, Upload} {
 		bytes := plan.Download
 		if direction == Upload {
 			bytes = plan.Upload
 		}
+
 		if plan.Loop {
 			if direction != plan.Direction {
 				continue
@@ -60,6 +69,7 @@ func Run[E Engine](ctx context.Context, engine E, plan Plan, progress func(Snaps
 		} else if bytes == 0 {
 			continue
 		}
+
 		err = engine.Transfer(ctx, Job{
 			Direction: direction, Bytes: bytes, Loop: plan.Loop,
 			Concurrency: plan.Concurrency, Rate: plan.Rate, Timeout: plan.Timeout,
@@ -68,12 +78,9 @@ func Run[E Engine](ctx context.Context, engine E, plan Plan, progress func(Snaps
 			break
 		}
 	}
-	durationReached := plan.Loop && plan.Duration > 0 && errors.Is(err, context.DeadlineExceeded) && errors.Is(ctx.Err(), context.DeadlineExceeded)
-	cancel()
-	<-done
-	report.Snapshot = meter.Snapshot()
+
 	report.State = "completed"
-	if durationReached {
+	if plan.Loop && plan.Duration > 0 && errors.Is(err, context.DeadlineExceeded) && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		report.State, err = "duration_reached", nil
 	} else if err != nil {
 		report.State = "failed"
@@ -82,10 +89,17 @@ func Run[E Engine](ctx context.Context, engine E, plan Plan, progress func(Snaps
 		} else if errors.Is(err, context.DeadlineExceeded) {
 			report.State = "timed_out"
 		}
+
 		report.Error = err.Error()
 	}
+
+	cancel()
+	<-done
+
+	report.Snapshot = meter.Snapshot()
 	if seconds := report.Elapsed.Seconds(); seconds > 0 {
 		report.AverageRate = (float64(report.Uploaded) + float64(report.Downloaded)) / seconds
 	}
+
 	return report, err
 }

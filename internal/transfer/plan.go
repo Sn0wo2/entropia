@@ -34,7 +34,8 @@ type Job struct {
 }
 
 type Engine interface {
-	Transfer(context.Context, Job, *Meter) error
+	Init() error
+	Transfer(ctx context.Context, job Job, meter *Meter) error
 }
 
 func (p Plan) Validate() error {
@@ -52,5 +53,6 @@ func (p Plan) Validate() error {
 	case !p.Loop && p.Download == 0 && p.Upload == 0:
 		return errors.New("specify --download, --upload, or --loop")
 	}
+
 	return nil
 }
