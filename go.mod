@@ -1,6 +1,6 @@
 module github.com/Sn0wo2/entropia
 
-go 1.27
+go 1.27.3
 
 require (
 	github.com/Sn0wo2/caelum v0.4.0
