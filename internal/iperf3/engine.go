@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Sn0wo2/entropia/internal/transfer"
@@ -29,6 +30,24 @@ type Engine struct {
 	probe      sync.Once
 	probeErr   error
 	jsonStream bool
+}
+
+type byteCount struct {
+	Bytes int64 `json:"bytes"`
+}
+
+type summary struct {
+	Sum         *byteCount `json:"sum"`
+	SumSent     *byteCount `json:"sum_sent"`
+	SumReceived *byteCount `json:"sum_received"`
+	Error       string     `json:"error"`
+}
+
+type streamMessage struct {
+	Event string          `json:"event"`
+	Data  json.RawMessage `json:"data"`
+	End   *summary        `json:"end"`
+	Error string          `json:"error"`
 }
 
 func (e *Engine) Init() error {
@@ -79,8 +98,39 @@ func (e *Engine) Transfer(ctx context.Context, job transfer.Job, meter *transfer
 		return errors.New("iperf3 rate is outside the supported bytes/s range")
 	}
 
+	e.probeCapabilities(ctx, job.Timeout)
+
+	if e.probeErr != nil {
+		return e.probeErr
+	}
+
+	for ctx.Err() == nil {
+		args, err := e.arguments(ctx, job)
+		if err != nil {
+			return err
+		}
+
+		if err := e.transferAttempt(ctx, job, meter, counter, args); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			meter.Failures.Add(1)
+
+			return err
+		}
+
+		if !job.Loop {
+			return nil
+		}
+	}
+
+	return ctx.Err()
+}
+
+func (e *Engine) probeCapabilities(ctx context.Context, timeout time.Duration) {
 	e.probe.Do(func() {
-		probeCtx, cancel := context.WithTimeout(ctx, min(job.Timeout, 5*time.Second))
+		probeCtx, cancel := context.WithTimeout(ctx, min(timeout, 5*time.Second))
 		defer cancel()
 
 		cmd := utils.Command(probeCtx, e.bin, "--help")
@@ -98,211 +148,186 @@ func (e *Engine) Transfer(ctx context.Context, job transfer.Job, meter *transfer
 
 		e.jsonStream = bytes.Contains(output.Data, []byte("--json-stream"))
 	})
+}
 
-	if e.probeErr != nil {
-		return e.probeErr
+func (e *Engine) arguments(ctx context.Context, job transfer.Job) ([]string, error) {
+	args := []string{"-c", e.host, "-p", e.port, "-P", "1"}
+	if job.Direction == transfer.Download {
+		args = append(args, "-R")
 	}
 
-	for ctx.Err() == nil {
-		args := []string{"-c", e.host, "-p", e.port, "-P", "1"}
-		if job.Direction == transfer.Download {
-			args = append(args, "-R")
-		}
-
-		if job.Loop {
-			chunk := 5 * time.Second
-			if e.jsonStream {
-				chunk = 30 * time.Second
-			}
-
-			if job.Timeout <= time.Second {
-				return errors.New("iperf3 loop requires --timeout greater than 1s")
-			}
-
-			chunk = min(chunk, job.Timeout-time.Second)
-			if deadline, ok := ctx.Deadline(); ok {
-				chunk = min(chunk, max(time.Second, time.Until(deadline)))
-			}
-
-			args = append(args, "-t", strconv.FormatInt(max(1, int64(chunk/time.Second)), 10))
-		} else {
-			args = append(args, "-n", strconv.FormatInt(job.Bytes, 10), "-l", strconv.FormatInt(min(job.Bytes, 32*1024), 10))
-		}
-
-		if job.Rate > 0 {
-			args = append(args, "-b", strconv.FormatInt(job.Rate*8, 10))
-		}
-
+	if job.Loop {
+		chunk := 5 * time.Second
 		if e.jsonStream {
-			args = append(args, "--json-stream", "--forceflush", "-i", "1")
-		} else {
-			args = append(args, "-J", "-i", "0")
+			chunk = 30 * time.Second
 		}
 
-		err := func() error {
-			type byteCount struct {
-				Bytes int64 `json:"bytes"`
-			}
-
-			type summary struct {
-				Sum         *byteCount `json:"sum"`
-				SumSent     *byteCount `json:"sum_sent"`
-				SumReceived *byteCount `json:"sum_received"`
-				Error       string     `json:"error"`
-			}
-
-			attemptCtx, cancel := context.WithTimeout(ctx, job.Timeout)
-			defer cancel()
-
-			cmd := utils.Command(attemptCtx, e.bin, args...)
-
-			stdout, err := cmd.StdoutPipe()
-			if err != nil {
-				return err
-			}
-
-			stderr := &utils.BoundedBuffer{Limit: 8 * 1024}
-			cmd.Stderr = stderr
-
-			meter.Attempts.Add(1)
-
-			if err := cmd.Start(); err != nil {
-				return fmt.Errorf("start iperf3: %w", err)
-			}
-
-			reader := &io.LimitedReader{R: stdout}
-			decoder := json.NewDecoder(reader)
-
-			var parseErr error
-
-			var (
-				reported      int64
-				final         *summary
-				protocolError string
-			)
-
-			for {
-				reader.N = 64 * 1024
-
-				var message struct {
-					Event string          `json:"event"`
-					Data  json.RawMessage `json:"data"`
-					End   *summary        `json:"end"`
-					Error string          `json:"error"`
-				}
-				if err := decoder.Decode(&message); err != nil {
-					if !errors.Is(err, io.EOF) {
-						parseErr = fmt.Errorf("parse bounded iperf3 JSON output: %w", err)
-
-						cancel()
-					}
-
-					break
-				}
-
-				if message.Error != "" {
-					protocolError = message.Error
-				}
-
-				if message.End != nil {
-					final = message.End
-				}
-
-				if message.Event == "error" && len(message.Data) > 0 && message.Data[0] == '"' {
-					if err := json.Unmarshal(message.Data, &protocolError); err != nil {
-						parseErr = err
-
-						cancel()
-
-						break
-					}
-
-					continue
-				}
-
-				if message.Event != "interval" && message.Event != "end" && message.Event != "error" {
-					continue
-				}
-
-				var data summary
-				if err := json.Unmarshal(message.Data, &data); err != nil {
-					parseErr = err
-
-					cancel()
-
-					break
-				}
-
-				if data.Error != "" {
-					protocolError = data.Error
-				}
-
-				if message.Event == "end" {
-					final = &data
-				} else if message.Event == "interval" && data.Sum != nil && data.Sum.Bytes > 0 {
-					reported += data.Sum.Bytes
-					counter.Add(data.Sum.Bytes)
-				}
-			}
-
-			waitErr := cmd.Wait()
-
-			if final != nil {
-				count := final.SumSent
-				if job.Direction == transfer.Download {
-					count = final.SumReceived
-				}
-
-				if count != nil && count.Bytes > reported {
-					counter.Add(count.Bytes - reported)
-					reported = count.Bytes
-				}
-			}
-
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-
-			if parseErr != nil {
-				return parseErr
-			}
-
-			if attemptCtx.Err() != nil {
-				return fmt.Errorf("iperf3 operation timed out: %w", attemptCtx.Err())
-			}
-
-			if protocolError != "" {
-				return fmt.Errorf("iperf3: %s", protocolError)
-			}
-
-			if waitErr != nil {
-				return fmt.Errorf("iperf3: %w: %.8192s", waitErr, strings.TrimSpace(string(stderr.Data)))
-			}
-
-			if final == nil || reported == 0 || (!job.Loop && reported < job.Bytes) {
-				return errors.New("iperf3 did not report a completed transfer matching the byte goal")
-			}
-
-			if job.Direction == transfer.Upload && final.SumReceived != nil {
-				meter.ConfirmedUpload.Add(min(reported, max(0, final.SumReceived.Bytes)))
-			}
-
-			return nil
-		}()
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-
-			meter.Failures.Add(1)
-
-			return err
+		if job.Timeout <= time.Second {
+			return nil, errors.New("iperf3 loop requires --timeout greater than 1s")
 		}
 
-		if !job.Loop {
-			return nil
+		chunk = min(chunk, job.Timeout-time.Second)
+		if deadline, ok := ctx.Deadline(); ok {
+			chunk = min(chunk, max(time.Second, time.Until(deadline)))
+		}
+
+		args = append(args, "-t", strconv.FormatInt(max(1, int64(chunk/time.Second)), 10))
+	} else {
+		args = append(args, "-n", strconv.FormatInt(job.Bytes, 10), "-l", strconv.FormatInt(min(job.Bytes, 32*1024), 10))
+	}
+
+	if job.Rate > 0 {
+		args = append(args, "-b", strconv.FormatInt(job.Rate*8, 10))
+	}
+
+	if e.jsonStream {
+		args = append(args, "--json-stream", "--forceflush", "-i", "1")
+	} else {
+		args = append(args, "-J", "-i", "0")
+	}
+
+	return args, nil
+}
+
+func (e *Engine) transferAttempt(ctx context.Context, job transfer.Job, meter *transfer.Meter, counter *atomic.Int64, args []string) error {
+	attemptCtx, cancel := context.WithTimeout(ctx, job.Timeout)
+	defer cancel()
+
+	cmd := utils.Command(attemptCtx, e.bin, args...)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+
+	stderr := &utils.BoundedBuffer{Limit: 8 * 1024}
+	cmd.Stderr = stderr
+
+	meter.Attempts.Add(1)
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start iperf3: %w", err)
+	}
+
+	reader := &io.LimitedReader{R: stdout}
+	decoder := json.NewDecoder(reader)
+	reported, final, protocolError, parseErr := readOutput(reader, decoder, cancel, counter)
+	waitErr := cmd.Wait()
+
+	if final != nil {
+		count := final.SumSent
+		if job.Direction == transfer.Download {
+			count = final.SumReceived
+		}
+
+		if count != nil && count.Bytes > reported {
+			counter.Add(count.Bytes - reported)
+			reported = count.Bytes
 		}
 	}
 
-	return ctx.Err()
+	return validateAttempt(ctx, attemptCtx, job, meter, final, reported, protocolError, parseErr, waitErr, stderr)
+}
+
+func readOutput(reader *io.LimitedReader, decoder *json.Decoder, cancel context.CancelFunc, counter *atomic.Int64) (int64, *summary, string, error) {
+	var parseErr error
+
+	var reported int64
+
+	var final *summary
+
+	var protocolError string
+
+	for {
+		reader.N = 64 * 1024
+
+		var message streamMessage
+		if err := decoder.Decode(&message); err != nil {
+			if !errors.Is(err, io.EOF) {
+				parseErr = fmt.Errorf("parse bounded iperf3 JSON output: %w", err)
+
+				cancel()
+			}
+
+			break
+		}
+
+		if message.Error != "" {
+			protocolError = message.Error
+		}
+
+		if message.End != nil {
+			final = message.End
+		}
+
+		if message.Event == "error" && len(message.Data) > 0 && message.Data[0] == '"' {
+			if err := json.Unmarshal(message.Data, &protocolError); err != nil {
+				parseErr = err
+
+				cancel()
+
+				break
+			}
+
+			continue
+		}
+
+		if message.Event != "interval" && message.Event != "end" && message.Event != "error" {
+			continue
+		}
+
+		var data summary
+		if err := json.Unmarshal(message.Data, &data); err != nil {
+			parseErr = err
+
+			cancel()
+
+			break
+		}
+
+		if data.Error != "" {
+			protocolError = data.Error
+		}
+
+		if message.Event == "end" {
+			final = &data
+		} else if message.Event == "interval" && data.Sum != nil && data.Sum.Bytes > 0 {
+			reported += data.Sum.Bytes
+			counter.Add(data.Sum.Bytes)
+		}
+	}
+
+	return reported, final, protocolError, parseErr
+}
+
+func validateAttempt(ctx, attemptCtx context.Context, job transfer.Job, meter *transfer.Meter, final *summary, reported int64, protocolError string, parseErr, waitErr error, stderr *utils.BoundedBuffer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if parseErr != nil {
+		return parseErr
+	}
+
+	if attemptCtx.Err() != nil {
+		return fmt.Errorf("iperf3 operation timed out: %w", attemptCtx.Err())
+	}
+
+	if protocolError != "" {
+		return fmt.Errorf("iperf3: %s", protocolError)
+	}
+
+	if waitErr != nil {
+		return fmt.Errorf("iperf3: %w: %.8192s", waitErr, strings.TrimSpace(string(stderr.Data)))
+	}
+
+	if final == nil || reported == 0 || (!job.Loop && reported < job.Bytes) {
+		return errors.New("iperf3 did not report a completed transfer matching the byte goal")
+	}
+
+	if job.Direction == transfer.Upload && final.SumReceived != nil {
+		meter.ConfirmedUpload.Add(min(reported, max(0, final.SumReceived.Bytes)))
+	}
+
+	return nil
 }
