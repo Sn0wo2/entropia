@@ -1,6 +1,7 @@
 version: "2"
 
 linters:
+  default: none
   enable:
     - asasalint
     - asciicheck
@@ -13,6 +14,7 @@ linters:
     - dupl
     - dupword
     - durationcheck
+    - errcheck
     - errchkjson
     - errname
     - errorlint
@@ -28,7 +30,9 @@ linters:
     - gosec
     - gosmopolitan
     - goprintffuncname
+    - govet
     - inamedparam
+    - ineffassign
     - interfacebloat
     - iface
     - intrange
@@ -52,9 +56,11 @@ linters:
     - protogetter
     - recvcheck
     - reassign
+    - revive
     - rowserrcheck
     - sloglint
     - spancheck
+    - staticcheck
     - tagalign
     - testableexamples
     - testifylint
@@ -62,22 +68,27 @@ linters:
     - tparallel
     - unconvert
     - unparam
+    - unused
     - usestdlibvars
     - usetesting
     - wastedassign
     - whitespace
     - wsl_v5
     - zerologlint
+
+  settings:
+    revive:
+      enable-default-rules: false
+      rules:
+        - name: var-declaration
+
   exclusions:
     rules:
       - path: internal/utils/command\.go
         linters:
           - gosec
-        text: G204
-      - path: internal/(cli/cli|http/engine|iperf3/engine)\.go
-        linters:
-          - maintidx
-        text: "Function name: (Execute|Transfer)"
+        text: "G204: Subprocess launched with variable"
+        source: 'exec\.CommandContext\(ctx, name, args\.\.\.\)'
 
 run:
   concurrency: 4
